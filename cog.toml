@@ -1,0 +1,5 @@
+ignore_merge_commits = true
+
+[changelog]
+path = "CHANGELOG.md"
+authors = ["Ku6epXBOCTuK"]
