@@ -2,4 +2,11 @@ ignore_merge_commits = true
 
 [changelog]
 path = "CHANGELOG.md"
-authors = ["Ku6epXBOCTuK"]
+template = "remote"
+remote = "github.com"
+owner = "Ku6epXBOCTuK"
+repository = "updater"
+
+[[authors]]
+signature = "Ku6epXBOCTuK@gmail.com"
+username = "Ku6epXBOCTuK"
