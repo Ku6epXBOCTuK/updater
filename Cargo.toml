@@ -2,6 +2,8 @@
 name = "updater"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Universal self-update system for portable Windows applications"
 
 [[bin]]
 name = "sign_tool"
