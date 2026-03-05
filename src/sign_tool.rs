@@ -8,11 +8,14 @@ use rand::rngs::OsRng;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use std::{
-    error::Error,
     fs, io,
     path::{Path, PathBuf},
 };
-use updater::{UpdateManifest, format_canonical};
+use updater::{
+    UpdateManifest,
+    error::{IoAction, UpdaterError},
+    format_canonical,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "sign-tool", version = env!("CARGO_PKG_VERSION"), 
@@ -38,30 +41,28 @@ struct GenerateKeysArgs {
     force: bool,
 }
 
-fn generate_keys(out_dir: PathBuf, force: bool) -> Result<(), Box<dyn Error>> {
+fn generate_keys(out_dir: PathBuf, force: bool) -> Result<(), UpdaterError> {
     let priv_path = out_dir.join("private_key.pem");
     let pub_path = out_dir.join("public_key.hex");
 
     if out_dir.exists() && out_dir.is_file() {
-        return Err(format!(
-            "Output path '{}' is a file, but a directory is required.",
-            out_dir.display()
-        )
-        .into());
+        return Err(UpdaterError::OutputIsFile(out_dir.display().to_string()));
     }
 
     if !force && (priv_path.exists() || pub_path.exists()) {
-        return Err(format!(
-            "Key files already exist in '{}'. Use -f or --force to overwrite.\n  Private key: {}\n  Public key: {}",
-            out_dir.display(),
-            priv_path.display(),
-            pub_path.display()
-        ).into());
+        return Err(UpdaterError::KeyAlreadyExists {
+            path: out_dir,
+            private: priv_path,
+            public: pub_path,
+        });
     }
 
     println!("Creating directory: {}", out_dir.display());
-    fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Failed to create directory '{}': {}", out_dir.display(), e))?;
+    fs::create_dir_all(&out_dir).map_err(|e| UpdaterError::Io {
+        action: IoAction::CreateDir,
+        path: out_dir,
+        source: e,
+    })?;
 
     println!("Generating Ed25519 key pair...");
     let mut csprng = OsRng;
@@ -70,23 +71,18 @@ fn generate_keys(out_dir: PathBuf, force: bool) -> Result<(), Box<dyn Error>> {
     println!("Writing private key to: {}", priv_path.display());
     signing_key
         .write_pkcs8_pem_file(&priv_path, Default::default())
-        .map_err(|e| {
-            format!(
-                "Failed to write private key to '{}': {}",
-                priv_path.display(),
-                e
-            )
+        .map_err(|e| UpdaterError::KeyWriteFailed {
+            path: priv_path,
+            source: e,
         })?;
 
     let public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
 
     println!("Writing public key to: {}", pub_path.display());
-    fs::write(&pub_path, &public_key_hex).map_err(|e| {
-        format!(
-            "Failed to write public key to '{}': {}",
-            pub_path.display(),
-            e
-        )
+    fs::write(&pub_path, &public_key_hex).map_err(|e| UpdaterError::Io {
+        action: IoAction::WriteFile,
+        path: pub_path,
+        source: e,
     })?;
 
     println!("Keys generated successfully!");
@@ -124,81 +120,59 @@ fn sign(
     private_key: PathBuf,
     output: PathBuf,
     force: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), UpdaterError> {
     println!("Validating input parameters...");
 
-    if !package.exists() {
-        return Err(format!(
-            "package file '{}' does not exist or is not accessible",
-            package.display()
-        )
-        .into());
-    }
-
-    if !package
-        .extension()
-        .map_or(false, |ext| ext.eq_ignore_ascii_case("zip"))
-    {
-        return Err(format!(
-            "package file '{}' is not a ZIP file. Expected .zip extension",
-            package.display()
-        )
-        .into());
-    }
-
+    validate_package(&package)?;
     validate_url(&url)?;
     validate_version(&version)?;
 
     if !private_key.exists() {
-        return Err(format!(
-            "Private key file '{}' does not exist or is not accessible",
-            private_key.display()
-        )
-        .into());
+        return Err(UpdaterError::PrivateKeyNotFound(private_key));
     }
 
     if !force && output.exists() {
-        return Err(format!(
-            "Output file '{}' already exists. Use -f or --force to overwrite",
-            output.display()
-        )
-        .into());
+        return Err(UpdaterError::ManifestAlreadyExists(output));
     }
 
     let output_parent = output.parent().unwrap_or_else(|| Path::new("."));
     if !output_parent.exists() {
         println!("Creating directory: {}", output_parent.display());
-        fs::create_dir_all(output_parent).map_err(|e| {
-            format!(
-                "Failed to create directory '{}': {}",
-                output_parent.display(),
-                e
-            )
+        fs::create_dir_all(output_parent).map_err(|e| UpdaterError::Io {
+            action: IoAction::CreateDir,
+            path: output_parent.to_path_buf(),
+            source: e,
         })?;
     }
 
     println!("Loading private key from: {}", private_key.display());
-    let private_key_content = fs::read_to_string(&private_key).map_err(|e| {
-        format!(
-            "Failed to read private key file '{}': {}",
-            private_key.display(),
-            e
-        )
+    let private_key_content = fs::read_to_string(&private_key).map_err(|e| UpdaterError::Io {
+        action: IoAction::ReadFile,
+        path: private_key,
+        source: e,
     })?;
+
     let signing_key = SigningKey::from_pkcs8_pem(&private_key_content).map_err(|e| {
-        format!(
-            "Failed to parse private key from '{}': {}",
-            private_key.display(),
-            e
-        )
+        UpdaterError::PrivateKeyParseFailed {
+            content: private_key_content,
+            source: e,
+        }
     })?;
 
     println!("Calculating SHA256 hash for package: {}", package.display());
-    let mut file = fs::File::open(&package)
-        .map_err(|e| format!("Failed to open package file '{}': {}", package.display(), e))?;
+    let mut file = fs::File::open(&package).map_err(|e| UpdaterError::Io {
+        action: IoAction::OpenFile,
+        path: package.clone(),
+        source: e,
+    })?;
+
     let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)
-        .map_err(|e| format!("Failed to read package file '{}': {}", package.display(), e))?;
+    io::copy(&mut file, &mut hasher).map_err(|e| UpdaterError::Io {
+        action: IoAction::ReadFile,
+        path: package,
+        source: e,
+    })?;
+
     let hash_bytes = hasher.finalize();
     let hash_hex = hex::encode(hash_bytes);
 
@@ -211,22 +185,20 @@ fn sign(
 
     let manifest: UpdateManifest = UpdateManifest {
         url: url.clone(),
-        version: version,
+        version,
         sha256: hash_hex,
-        signature: signature.to_string(),
+        signature,
     };
 
     println!("Creating manifest...");
-    let manifest_json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| format!("Failed to serialize manifest to JSON: {}", e))?;
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).map_err(UpdaterError::SerializationFailed)?;
 
     println!("Writing manifest to: {}", output.display());
-    fs::write(&output, manifest_json).map_err(|e| {
-        format!(
-            "Failed to write manifest file '{}': {}",
-            output.display(),
-            e
-        )
+    fs::write(&output, manifest_json).map_err(|e| UpdaterError::Io {
+        action: IoAction::WriteFile,
+        path: output.clone(),
+        source: e,
     })?;
 
     println!("Manifest created successfully at: {}", output.display());
@@ -237,30 +209,36 @@ fn sign(
     Ok(())
 }
 
-fn validate_url(url: &str) -> Result<(), Box<dyn Error>> {
-    if !url.starts_with("https://") {
-        return Err(format!(
-            "URL '{}' must start with 'https://'. HTTP is not supported for security reasons",
-            url
-        )
-        .into());
+fn validate_package(package: &Path) -> Result<(), UpdaterError> {
+    if !package.exists() {
+        return Err(UpdaterError::PackageNotFound(package.to_path_buf()));
+    }
+
+    if !package
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
+        return Err(UpdaterError::InvalidPackageFormat(package.to_path_buf()));
     }
     Ok(())
 }
 
-fn validate_version(version: &str) -> Result<(), Box<dyn Error>> {
-    Version::parse(version).map_err(|e| {
-        format!(
-            "Invalid SemVer version '{}': {}. Expected format: X.Y.Z (e.g., 1.2.3, 2.0.0-beta.1)",
-            version, e
-        )
+fn validate_url(url: &str) -> Result<(), UpdaterError> {
+    if !url.starts_with("https://") {
+        return Err(UpdaterError::UrlInvalid(url.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_version(version: &str) -> Result<(), UpdaterError> {
+    Version::parse(version).map_err(|e| UpdaterError::VersionInvalid {
+        version: version.to_string(),
+        source: e,
     })?;
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
-
+fn run(cli: Cli) -> Result<(), UpdaterError> {
     match cli.command {
         Commands::GenerateKeys(args) => {
             generate_keys(args.out_dir, args.force)?;
@@ -275,9 +253,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 args.force,
             )?;
         }
-    }
+    };
 
     Ok(())
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    if let Err(err) = run(cli) {
+        eprintln!("Error: {}", err);
+        std::process::exit(err.to_exit_code() as i32);
+    }
 }
 
 #[cfg(test)]

@@ -1,19 +1,17 @@
 use assert_cmd::{Command, cargo};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signature, VerifyingKey};
-use predicates::prelude::*;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tempfile::tempdir;
-use updater::format_canonical;
+use updater::{error::ExitCode, format_canonical};
 use zip::write::FileOptions;
 
 static BIN_PATH: LazyLock<PathBuf> = LazyLock::new(|| cargo::cargo_bin!("sign-tool").into());
 
-// Вспомогательная функция для создания фиктивного ZIP-файла
 fn create_dummy_zip(path: &Path) {
     let file = fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
@@ -32,19 +30,15 @@ fn test_generate_keys_creates_files() {
 
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&["generate-keys", "--out-dir", out_dir.to_str().unwrap()]);
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("Keys generated successfully"));
+    cmd.assert().success();
 
     assert!(out_dir.join("private_key.pem").exists());
     assert!(out_dir.join("public_key.hex").exists());
 
-    // Проверить, что public_key.hex содержит 64 hex-символа
     let pub_key_hex = fs::read_to_string(out_dir.join("public_key.hex")).unwrap();
     assert_eq!(pub_key_hex.len(), 64);
     assert!(pub_key_hex.chars().all(|c| c.is_ascii_hexdigit()));
 
-    // Проверить, что private_key.pem содержит PEM-заголовок
     let priv_key_pem = fs::read_to_string(out_dir.join("private_key.pem")).unwrap();
     assert!(priv_key_pem.contains("BEGIN PRIVATE KEY"));
 }
@@ -58,9 +52,7 @@ fn test_generate_keys_existing_without_force_fails() {
 
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&["generate-keys", "--out-dir", out_dir.to_str().unwrap()]);
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("Key files already exist"));
+    cmd.assert().code(ExitCode::AccessError as i32);
 }
 
 #[test]
@@ -91,9 +83,7 @@ fn test_generate_keys_out_dir_is_file_error() {
 
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&["generate-keys", "--out-dir", out_file.to_str().unwrap()]);
-    cmd.assert().failure().stderr(predicate::str::contains(
-        "is a file, but a directory is required",
-    ));
+    cmd.assert().code(ExitCode::InvalidInput as i32);
 }
 
 // ==================== sign tests ====================
@@ -102,13 +92,11 @@ fn test_generate_keys_out_dir_is_file_error() {
 fn test_sign_with_valid_inputs() {
     let temp_dir = tempdir().unwrap();
 
-    // Сгенерировать ключи
     let keys_dir = temp_dir.path().join("keys");
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&["generate-keys", "--out-dir", keys_dir.to_str().unwrap()]);
     cmd.assert().success();
 
-    // Создать тестовый ZIP
     let zip_path = temp_dir.path().join("package.zip");
     create_dummy_zip(&zip_path);
 
@@ -134,26 +122,24 @@ fn test_sign_with_valid_inputs() {
 
     assert!(output.exists());
 
-    // Проверить содержимое JSON
     let manifest_content = fs::read_to_string(&output).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
     assert_eq!(manifest["version"], version);
     assert_eq!(manifest["url"], url);
 
-    // Пересчитать SHA256
     let mut file = fs::File::open(&zip_path).unwrap();
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).unwrap();
     let expected_sha256 = hex::encode(hasher.finalize());
     assert_eq!(manifest["sha256"].as_str().unwrap(), expected_sha256);
 
-    // Верифицировать подпись
     let signature_b64 = manifest["signature"].as_str().unwrap();
     let public_key_hex = fs::read_to_string(keys_dir.join("public_key.hex")).unwrap();
     let public_key_bytes = hex::decode(public_key_hex).unwrap();
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes.try_into().unwrap()).unwrap();
     let signature_bytes = BASE64.decode(signature_b64).unwrap();
+    assert_eq!(signature_bytes.len(), 64);
     let signature = Signature::from_bytes(&signature_bytes.try_into().unwrap());
 
     let canonical = format_canonical(version, url, &expected_sha256);
@@ -174,15 +160,13 @@ fn test_sign_invalid_url() {
         "--package",
         zip_path.to_str().unwrap(),
         "--url",
-        "http://insecure.com/package.zip", // не HTTPS
+        "http://insecure.com/package.zip",
         "--version",
         "1.0.0",
         "--private-key",
         "dummy",
     ]);
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("must start with 'https://'"));
+    cmd.assert().code(ExitCode::InvalidInput as i32);
 }
 
 #[test]
@@ -203,9 +187,7 @@ fn test_sign_invalid_version() {
         "--private-key",
         "dummy",
     ]);
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("Invalid SemVer version"));
+    cmd.assert().code(ExitCode::DataError as i32);
 }
 
 #[test]
@@ -225,9 +207,7 @@ fn test_sign_package_not_found() {
         "--private-key",
         "dummy",
     ]);
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("does not exist"));
+    cmd.assert().code(ExitCode::InvalidInput as i32);
 }
 
 #[test]
@@ -249,16 +229,13 @@ fn test_sign_private_key_not_found() {
         "--private-key",
         private_key_path.to_str().unwrap(),
     ]);
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("does not exist"));
+    cmd.assert().code(ExitCode::InvalidInput as i32);
 }
 
 #[test]
 fn test_sign_output_exists_without_force_fails() {
     let temp_dir = tempdir().unwrap();
 
-    // Сгенерировать ключи
     let keys_dir = temp_dir.path().join("keys");
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&["generate-keys", "--out-dir", keys_dir.to_str().unwrap()]);
@@ -267,7 +244,7 @@ fn test_sign_output_exists_without_force_fails() {
     let zip_path = temp_dir.path().join("package.zip");
     create_dummy_zip(&zip_path);
     let output = temp_dir.path().join("update_manifest.json");
-    fs::write(&output, "dummy").unwrap(); // создать файл
+    fs::write(&output, "dummy").unwrap();
 
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&[
@@ -283,9 +260,7 @@ fn test_sign_output_exists_without_force_fails() {
         "--output",
         output.to_str().unwrap(),
     ]);
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("already exists"));
+    cmd.assert().code(ExitCode::AccessError as i32);
 }
 
 #[test]
@@ -334,7 +309,7 @@ fn test_sign_creates_output_directory() {
 
     let zip_path = temp_dir.path().join("package.zip");
     create_dummy_zip(&zip_path);
-    let output = temp_dir.path().join("subdir").join("manifest.json"); // директория не существует
+    let output = temp_dir.path().join("subdir").join("manifest.json");
 
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&[
@@ -355,7 +330,6 @@ fn test_sign_creates_output_directory() {
     assert!(output.exists());
 }
 
-// Тест на детерминизм подписи (опционально)
 #[test]
 fn test_sign_deterministic() {
     let temp_dir = tempdir().unwrap();
@@ -373,7 +347,6 @@ fn test_sign_deterministic() {
     let output1 = temp_dir.path().join("manifest1.json");
     let output2 = temp_dir.path().join("manifest2.json");
 
-    // Первая подпись
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&[
         "sign",
@@ -390,7 +363,6 @@ fn test_sign_deterministic() {
     ]);
     cmd.assert().success();
 
-    // Вторая подпись
     let mut cmd = Command::new(&*BIN_PATH);
     cmd.args(&[
         "sign",
