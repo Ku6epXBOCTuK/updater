@@ -1,3 +1,4 @@
+use base64::{Engine, prelude::BASE64_STANDARD as BASE64};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::{
     Signer, SigningKey,
@@ -11,7 +12,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
 };
-use updater::UpdateManifest;
+use updater::{UpdateManifest, format_canonical};
 
 #[derive(Parser, Debug)]
 #[command(name = "sign-tool", version = env!("CARGO_PKG_VERSION"), 
@@ -206,6 +207,7 @@ fn sign(
     println!("Creating signature...");
     let canonical = format_canonical(&version, &url, &hash_hex);
     let signature = signing_key.sign(canonical.as_bytes());
+    let signature = BASE64.encode(signature.to_bytes());
 
     let manifest: UpdateManifest = UpdateManifest {
         url: url.clone(),
@@ -233,10 +235,6 @@ fn sign(
     println!("  SHA256: {}", manifest.sha256);
 
     Ok(())
-}
-
-fn format_canonical(version: &str, url: &str, sha256: &str) -> String {
-    format!("{}|{}|{}", version, url, sha256)
 }
 
 fn validate_url(url: &str) -> Result<(), Box<dyn Error>> {
@@ -280,4 +278,57 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_url_valid_https() {
+        let url = "https://example.com/update.zip";
+        assert!(validate_url(url).is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_invalid_http() {
+        let url = "http://example.com/update.zip";
+        assert!(validate_url(url).is_err());
+    }
+
+    #[test]
+    fn test_validate_url_no_protocol() {
+        let url = "example.com/update.zip";
+        assert!(validate_url(url).is_err());
+    }
+
+    #[test]
+    fn test_validate_version_valid() {
+        let version = "1.2.3";
+        assert!(validate_version(version).is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_with_prerelease() {
+        let version = "1.2.3-beta.1";
+        assert!(validate_version(version).is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_with_build_metadata() {
+        let version = "1.2.3+build.123";
+        assert!(validate_version(version).is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_invalid_format() {
+        let version = "1.2";
+        assert!(validate_version(version).is_err());
+    }
+
+    #[test]
+    fn test_validate_version_invalid_characters() {
+        let version = "1.2.3.x";
+        assert!(validate_version(version).is_err());
+    }
 }
